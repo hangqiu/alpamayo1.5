@@ -105,6 +105,10 @@ class _ClipData:
         self._frame_cache: dict[int, dict[int, np.ndarray]] = {
             idx: {} for idx in self.cameras}
         self._frame_lock = threading.Lock()
+        # Per-camera decode lock: SeekVideoReader is NOT thread-safe.
+        # Only one thread may call decode_images_from_timestamps per camera at a time.
+        self._decode_locks: dict[int, threading.Lock] = {
+            idx: threading.Lock() for idx in self.cameras}
 
     # ------------------------------------------------------------------
     # Egomotion helpers (pure in-memory)
@@ -140,12 +144,23 @@ class _ClipData:
     # ------------------------------------------------------------------
 
     def _decode_and_cache(self, cam_idx: int, requested_ts: np.ndarray):
-        """Decode frames for requested timestamps and store in cache."""
-        reader = self.cameras[cam_idx]
-        imgs, _ = reader.decode_images_from_timestamps(requested_ts)
-        with self._frame_lock:
-            for ts, img in zip(requested_ts, imgs):
-                self._frame_cache[cam_idx][int(ts)] = img
+        """Decode frames for requested timestamps and store in cache.
+
+        Serialized per camera via _decode_locks — SeekVideoReader is not thread-safe.
+        Re-checks cache under the decode lock to avoid duplicate work when two
+        threads race to decode the same timestamps.
+        """
+        with self._decode_locks[cam_idx]:
+            # Re-check which timestamps are still missing now that we hold the lock
+            with self._frame_lock:
+                still_missing = requested_ts[
+                    np.array([t not in self._frame_cache[cam_idx] for t in requested_ts])]
+            if not len(still_missing):
+                return
+            imgs, _ = self.cameras[cam_idx].decode_images_from_timestamps(still_missing)
+            with self._frame_lock:
+                for ts, img in zip(still_missing, imgs):
+                    self._frame_cache[cam_idx][int(ts)] = img
 
     def get_frames(self, t0_us: int) -> dict[int, np.ndarray]:
         """Return {cam_idx: frame_hwc} for the frame at t0 for each camera.
@@ -359,7 +374,9 @@ def _render_at_t0(clip_data: _ClipData, t0_us: int) -> tuple | None:
         cam_grid = _build_camera_grid(
             frames, hist_ego, fut_ego, clip_data.cam_models, clip_data.cam_poses)
     except Exception as e:
+        import traceback
         print(f"[render] error {clip_data.clip_id} t0={t0_us}: {e}")
+        traceback.print_exc()
         return None
     result = (cam_grid, hist_ego, fut_ego)
     with _render_lock:
@@ -478,25 +495,38 @@ def render_sample(sample: dict, t0_offset_s: float, blocking: bool = True):
 # Gradio callbacks
 # ---------------------------------------------------------------------------
 
-def on_select(label: str, t0_offset_s: float):
+# Each navigation action is split into two chained steps:
+#   step 1 (fast): stop playback immediately, update index/label
+#   step 2 (slow): load & render (may block on network)
+
+def on_select_step1(label: str):
     idx = SAMPLE_LABELS.index(label)
+    return idx, False, "▶ Play"
+
+def on_select_step2(t0_offset_s: float, idx: int):
     cam, bev, meta = render_sample(SAMPLES[idx], t0_offset_s)
     _schedule_preload(SAMPLES[idx], t0_offset_s)
-    return cam, bev, meta, idx
+    return cam, bev, meta
 
 
-def on_prev(current_idx: int, t0_offset_s: float):
+def on_prev_step1(current_idx: int):
     idx = max(0, int(current_idx) - 1)
+    return idx, SAMPLE_LABELS[idx], False, "▶ Play"
+
+def on_prev_step2(t0_offset_s: float, idx: int):
     cam, bev, meta = render_sample(SAMPLES[idx], t0_offset_s)
     _schedule_preload(SAMPLES[idx], t0_offset_s)
-    return cam, bev, meta, idx, SAMPLE_LABELS[idx]
+    return cam, bev, meta
 
 
-def on_next(current_idx: int, t0_offset_s: float):
+def on_next_step1(current_idx: int):
     idx = min(len(SAMPLES) - 1, int(current_idx) + 1)
+    return idx, SAMPLE_LABELS[idx], False, "▶ Play"
+
+def on_next_step2(t0_offset_s: float, idx: int):
     cam, bev, meta = render_sample(SAMPLES[idx], t0_offset_s)
     _schedule_preload(SAMPLES[idx], t0_offset_s)
-    return cam, bev, meta, idx, SAMPLE_LABELS[idx]
+    return cam, bev, meta
 
 
 def on_t0_change(current_idx: int, t0_offset_s: float):
@@ -506,7 +536,7 @@ def on_t0_change(current_idx: int, t0_offset_s: float):
 
 def on_play_pause(is_playing: bool):
     new_playing = not is_playing
-    return new_playing, gr.update(active=new_playing), "⏸ Pause" if new_playing else "▶ Play"
+    return new_playing, "⏸ Pause" if new_playing else "▶ Play"
 
 
 def on_tick(current_idx: int, t0_offset_s: float, is_playing: bool):
@@ -564,19 +594,22 @@ with gr.Blocks(title="PhysicalAI-AV GT Browser") as demo:
             bev_out  = gr.Image(label="BEV ground truth", type="numpy")
             meta_out = gr.Textbox(label="Metadata", lines=5, interactive=False)
 
-    play_timer = gr.Timer(value=0.5, active=False)
+    play_timer = gr.Timer(value=0.5, active=True)
 
-    sample_dd.change(on_select,       [sample_dd, t0_slider], [cam_out, bev_out, meta_out, current_idx])
-    btn_prev.click(on_prev,           [current_idx, t0_slider], [cam_out, bev_out, meta_out, current_idx, sample_dd])
-    btn_next.click(on_next,           [current_idx, t0_slider], [cam_out, bev_out, meta_out, current_idx, sample_dd])
-    t0_slider.release(on_t0_change,   [current_idx, t0_slider], [cam_out, bev_out, meta_out])
-    btn_play.click(on_play_pause,     [is_playing], [is_playing, play_timer, btn_play])
-    play_timer.tick(on_tick,          [current_idx, t0_slider, is_playing], [t0_slider, cam_out, bev_out, meta_out])
+    sample_dd.change(on_select_step1, [sample_dd],             [current_idx, is_playing, btn_play])\
+             .then(on_select_step2,   [t0_slider, current_idx], [cam_out, bev_out, meta_out])
+    btn_prev.click(on_prev_step1,    [current_idx],             [current_idx, sample_dd, is_playing, btn_play])\
+            .then(on_prev_step2,     [t0_slider, current_idx],  [cam_out, bev_out, meta_out])
+    btn_next.click(on_next_step1,    [current_idx],             [current_idx, sample_dd, is_playing, btn_play])\
+            .then(on_next_step2,     [t0_slider, current_idx],  [cam_out, bev_out, meta_out])
+    t0_slider.release(on_t0_change,  [current_idx, t0_slider],  [cam_out, bev_out, meta_out])
+    btn_play.click(on_play_pause,    [is_playing],              [is_playing, btn_play])
+    play_timer.tick(on_tick,         [current_idx, t0_slider, is_playing], [t0_slider, cam_out, bev_out, meta_out])
     progress_timer.tick(get_status_html, [], [status_html])
 
     demo.load(
-        lambda: on_select(SAMPLE_LABELS[0], 0.0),
-        outputs=[cam_out, bev_out, meta_out, current_idx])
+        lambda: on_select_step2(0.0, 0),
+        outputs=[cam_out, bev_out, meta_out])
 
 
 if __name__ == "__main__":
