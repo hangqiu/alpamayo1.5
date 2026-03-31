@@ -57,7 +57,7 @@ INFERENCE_DIR = _HERE / "inference_results"
 _COND_DEFS = [
     ("with_nav",       "tab:blue",  (31, 119, 180),  "with nav"),
     ("no_nav",         "tab:red",   (214, 39, 40),   "no nav"),
-    ("counterfactual", "tab:green", (44, 160, 44),   "counterfactual"),
+    ("counterfactual", "tab:orange", (255, 127, 14),  "counterfactual"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -644,7 +644,7 @@ def _make_bev_img(
     preds = [
         (pred_with_nav,       "tab:blue",  "with nav"),
         (pred_no_nav,         "tab:red",   "no nav"),
-        (pred_counterfactual, "tab:green", "counterfactual"),
+        (pred_counterfactual, "tab:orange", "counterfactual"),
     ]
     for pred, color, label in preds:
         if pred is not None:
